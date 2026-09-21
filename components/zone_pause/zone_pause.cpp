@@ -44,6 +44,9 @@ void ZonePauseClimate::init() {
 }
 
 // Runs on the first bus notification, when preferences and the hub are fully up.
+// In active (SAM) mode the hub sends one during its own setup, so a saved pause is back
+// before Home Assistant connects. With sam_address 0 nothing here ever starts; pause
+// cannot work without SAM mode anyway, because it has no way to write.
 void ZonePauseClimate::ensure_started_() {
   if (this->started_)
     return;
@@ -151,9 +154,11 @@ void ZonePauseClimate::control(const climate::ClimateCall &call) {
   optional<float> low = call.get_target_temperature_low();
   optional<float> high = call.get_target_temperature_high();
   if (call.get_target_temperature().has_value()) {
-    if (this->mode == climate::CLIMATE_MODE_HEAT)
+    // Judge by the mode this same call asks for, if any, like InfinitESP does.
+    const climate::ClimateMode mode = call.get_mode().value_or(this->mode);
+    if (mode == climate::CLIMATE_MODE_HEAT)
       low = call.get_target_temperature();
-    else if (this->mode == climate::CLIMATE_MODE_COOL)
+    else if (mode == climate::CLIMATE_MODE_COOL)
       high = call.get_target_temperature();
   }
   if (low.has_value() || high.has_value()) {
@@ -496,7 +501,14 @@ void ZonePauseClimate::publish_all_() {
   }
 }
 
-void ZonePauseClimate::save_() { this->pref_.save(&this->data_); }
+// save() alone only queues the data; ESPHome writes its queue to flash once a minute.
+// A power cut inside that minute would forget a pause while the thermostat keeps the
+// zone held wide, so write it through straight away. Unchanged data is skipped, and
+// this runs a handful of times per pause, so flash wear is not a concern.
+void ZonePauseClimate::save_() {
+  if (this->pref_.save(&this->data_))
+    global_preferences->sync();
+}
 
 }  // namespace zone_pause
 }  // namespace esphome

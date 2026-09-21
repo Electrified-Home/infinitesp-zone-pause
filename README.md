@@ -46,8 +46,8 @@ card is needed.
    by anything else (wall control, the Carrier app, vacation mode), the pause ends, the
    switch turns off and that change stands.
 6. **A pause lasts until it is ended.** There are no timers.
-7. **Pause state survives a restart** of the ESP32 and is checked against the thermostat
-   afterwards.
+7. **Pause state survives a restart** of the ESP32, including a power cut (it is written
+   to flash immediately), and is checked against the thermostat afterwards.
 8. **Nothing is assumed.** A pause or resume counts only once the thermostat's own reply
    confirms it (checked 30 s after the command, one resend). If the thermostat does not
    accept a pause, the switch turns back off. Half a pause (wide setpoints without the
@@ -56,7 +56,13 @@ card is needed.
 ## Configuration
 
 Requires InfinitESP in active (SAM) mode. Give the InfinitESP zone an `id`, mark it
-`internal: true`, and let the wrapper take the zone's name:
+`internal: true`, name it `"<Zone> Climate"`, and let the wrapper take the zone's name.
+
+**The hidden block's name matters.** InfinitESP names the zone's other entities
+(Temperature, Humidity, Fan Mode, Hold Minutes, ...) after that block and drops a trailing
+"Climate". With `"Upstairs Climate"` they stay `Upstairs Temperature` and so on, exactly as
+before. Any other name (say `"Upstairs Raw"`) renames every one of them in Home Assistant.
+
 
 ```yaml
 external_components:
@@ -74,7 +80,7 @@ climate:
   - platform: infinitesp
     infinitesp_id: infinitesp_hub
     id: upstairs_raw
-    name: "Upstairs Raw"
+    name: "Upstairs Climate"   # see the note above
     internal: true
     zone: 1
 
@@ -101,6 +107,11 @@ hub methods directly, so an InfinitESP update may need a matching update here.
   2 degrees apart. They must be values the thermostat accepts; if it refuses them the
   pause ends and the log says so.
 - Presets are ignored while a zone is paused.
+- A target edited while paused must keep heat and cool at least 2 degrees apart. If your
+  thermostat is set to a wider deadband, it adjusts the values itself on resume.
+- If a pause cannot start (bus offline, no thermostat data yet) the switch simply turns
+  back off; the reason is in the ESPHome log. A toggle made while the previous pause or
+  resume is still being confirmed (up to 30 s) is queued and applied afterwards.
 - Vacation mode starting ends a pause.
 - A paused zone still heats below the wide heat value and cools above the wide cool
   value. That is intended: it is the freeze guard.
