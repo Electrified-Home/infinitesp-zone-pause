@@ -21,10 +21,9 @@ class ZonePauseSwitch : public switch_::Switch {
   ZonePauseClimate *parent_{nullptr};
 };
 
-// Proxy thermostat shown to Home Assistant for one Carrier zone. It always carries
-// the TARGET settings. While the zone is paused the target is remembered but not
-// applied, and the real zone is held at the wide pause setpoints. It knows nothing
-// about why a zone is paused; it only obeys the pause switch.
+// Proxy thermostat shown to Home Assistant for one Carrier zone. It always carries the
+// TARGET settings. Behavior: see the README, section "Behavior".
+// It knows nothing about why a zone is paused; it only obeys the pause switch.
 //
 // Deliberately NOT an ESPHome Component. InfinitESP documents an outage caused by
 // extra Component registrations next to its hub, so this follows the same
@@ -53,34 +52,64 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   bool is_paused() const { return data_.paused; }
 
  protected:
-  // Saved to flash so a paused zone survives a restart of the board.
+  enum Side : uint8_t { HEAT = 0, COOL = 1 };
+  // What the component is bringing the thermostat to.
+  enum Goal : uint8_t { GOAL_NONE = 0, GOAL_PAUSE = 1, GOAL_RESTORE = 2 };
+  enum HoldKind : uint8_t { HOLD_KIND_NONE, HOLD_KIND_PERMANENT, HOLD_KIND_TIMED };
+
+  // Saved to flash so a pause, or a restore that has not landed yet, survives a restart.
+  // Nothing per-send is kept here.
   struct Saved {
     uint8_t version;
     bool paused;
-    uint8_t target_heat;    // bus units; what the zone resumes to
+    uint8_t goal;
+    uint8_t target_heat;    // bus units. Goal PAUSE: the snapshot. Goal RESTORE: the value being put
+                            // back (an edit or an accepted outside change replaces it). The card shows it.
     uint8_t target_cool;
-    uint16_t hold_minutes;  // hold state when paused: 0 none, 0xFFFF permanent, else timed
+    uint16_t hold_minutes;  // hold when paused: 0 none, 0xFFFF permanent, else timed
     bool target_changed;    // the target was edited while paused
-    uint8_t applied_heat;   // wide values the thermostat actually adopted
-    uint8_t applied_cool;
+    uint8_t wide_heat;   // wide values in force for this pause
+    uint8_t wide_cool;
+    bool owed_heat;         // goal RESTORE: parts that have not landed yet
+    bool owed_cool;
+    bool owed_hold;
+    bool restore_hold;      // goal RESTORE: whether the hold is part of it at all
   } __attribute__((packed));
 
-  enum Phase : uint8_t { PHASE_IDLE, PHASE_PAUSING, PHASE_RESUMING };
-
   void ensure_started_();
-  bool read_actual_(uint8_t &heat, uint8_t &cool) const;
+  bool read_real_(uint8_t real[2], bool &permanent, uint16_t *hold_minutes = nullptr) const;
+  bool real_is_fresh_() const;
+  uint8_t read_confirmed_mode_() const;
+  static void landing_sides_(uint8_t mode, bool &heat, bool &cool);
+  static void watched_sides_(uint8_t mode, bool &heat, bool &cool);
+  static const char *mode_name_(uint8_t mode);
   bool bus_ready_() const;
   uint8_t pause_heat_bus_() const;
   uint8_t pause_cool_bus_() const;
-  void send_pause_writes_();
-  void send_resume_writes_();
-  void start_phase_(Phase phase);
-  void end_pause_without_restore_(const char *reason);
+  uint8_t goal_value_(Side side) const;
+  bool owed_(Side side) const { return side == HEAT ? data_.owed_heat : data_.owed_cool; }
+  void set_owed_(Side side, bool owed) {
+    if (side == HEAT)
+      data_.owed_heat = owed;
+    else
+      data_.owed_cool = owed;
+  }
+  HoldKind restore_hold_kind_() const;
+  void set_goal_(Goal goal);
+  void add_sent_(Side side, uint8_t value);
+  bool is_sent_(Side side, uint8_t value) const;
+  bool satisfied_(const uint8_t real[2], bool permanent) const;
+  void adopt_target_(Side side, uint8_t value);
+  void issue_send_(const uint8_t real[2]);
+  void judge_(const uint8_t real[2], bool permanent, bool quiet_period_just_ended);
+  void end_pause_by_deviation_(const uint8_t real[2], const bool deviated[2]);
+  void reconcile_after_restart_(const uint8_t real[2]);
   void evaluate_();
   void mirror_from_source_();
   void publish_actual_(uint8_t heat, uint8_t cool);
   void publish_all_();
   void save_();
+  void flush_();
 
   infinitesp::InfinitESPClimate *source_{nullptr};
   ZonePauseSwitch *pause_switch_{nullptr};
@@ -93,24 +122,36 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   Saved data_{};
   ESPPreferenceObject pref_;
   bool started_{false};
+  bool needs_reconcile_{false};  // state came from flash; check it against reality first
 
-  Phase phase_{PHASE_IDLE};
-  uint32_t phase_started_ms_{0};
-  uint8_t phase_attempts_{0};
-  uint8_t pre_heat_{0};  // the zone's setpoints just before pausing, to tell whether the write took
-  uint8_t pre_cool_{0};
-  bool queued_request_valid_{false};
-  bool queued_request_{false};
-  bool needs_reconcile_{false};  // paused state came from flash; check it against reality
+  // Sending: one send at a time, then a quiet period in which nothing is judged.
+  bool send_due_{false};
+  bool ever_sent_{false};
+  bool in_quiet_{false};
+  uint32_t last_send_ms_{0};
+  uint8_t confirmed_mode_{0xFF};  // the thermostat's own mode nibble, 0xFF until known
+  uint8_t resend_count_{0};       // sends repeated because a wanted value did not land
+  bool have_zones_reply_{false};  // a real 3B03 reply from the thermostat has been seen
+  uint32_t last_zones_reply_ms_{0};
+
+  // Judging: per side, the last real value accounted for, whether the goal value was seen
+  // during the quiet period, and the values this component sent since the goal was NONE.
+  uint8_t baseline_[2]{0, 0};
+  bool goal_seen_[2]{false, false};
+  uint8_t sent_[2][4]{};
+  uint32_t sent_ms_[2][4]{};
+  uint8_t sent_count_[2]{0, 0};
+
+  // The minutes paused are not saved, so after a restart a timed hold cannot be put back.
   bool restarted_since_pause_{false};
-  uint16_t paused_minutes_{0};
+  uint16_t paused_minutes_{0};  // minutes since the snapshot was taken
   uint32_t minute_accum_ms_{0};
   uint32_t last_tick_ms_{0};
   uint8_t last_actual_heat_{0};
   uint8_t last_actual_cool_{0};
   bool switch_published_{false};
-  bool hold_lost_{false};  // paused, wide setpoints still in place, but the hold is no longer permanent
-  uint32_t hold_lost_since_ms_{0};
+  bool dirty_{false};  // saved state changed but not yet written to flash
+  uint32_t last_sync_ms_{0};
 };
 
 }  // namespace zone_pause
