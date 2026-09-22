@@ -86,6 +86,7 @@ void ZonePauseClimate::ensure_started_() {
                loaded.paused ? "paused" : "settings were still being put back");
     }
   }
+  this->schedule_poll_at_ms_ = millis() + 20000UL * this->source_->get_zone();
   ESP_LOGI(TAG, "Zone %d: wide setpoints %d / %d F, paused: %s", this->source_->get_zone(), this->pause_heat_f_,
            this->pause_cool_f_, YESNO(this->data_.paused));
 }
@@ -97,6 +98,12 @@ void ZonePauseClimate::on_register_update(uint8_t device_addr, uint16_t register
   if (device_addr == infinitesp::ADDR_THERMOSTAT && register_key == infinitesp::REG_SAM_ZONES) {
     this->have_zones_reply_ = true;
     this->last_zones_reply_ms_ = now;
+  }
+  if (device_addr == infinitesp::ADDR_THERMOSTAT &&
+      register_key == (uint16_t) (infinitesp::REG_TSTAT_SCHEDULE + this->source_->get_zone() - 1) &&
+      !this->schedule_logged_) {
+    this->schedule_logged_ = true;
+    this->log_schedule_row_();
   }
   const bool first = !this->started_;
   this->ensure_started_();
@@ -113,6 +120,15 @@ void ZonePauseClimate::on_register_update(uint8_t device_addr, uint16_t register
       if (this->paused_minutes_ < 0xFFFF)
         this->paused_minutes_++;
     }
+  }
+  // One schedule read per zone, from the tick (never from inside the hub's notify path),
+  // staggered per zone and kept clear of our own sends.
+  if (!this->schedule_polled_ && this->started_ && now >= this->schedule_poll_at_ms_ && this->bus_ready_() &&
+      !this->in_quiet_ && !this->send_due_) {
+    this->schedule_polled_ = true;
+    const uint8_t row = 0x02 + this->source_->get_zone() - 1;
+    this->parent_->poll_register(0x40, row);
+    ESP_LOGI(TAG, "Zone %d: asked the thermostat for its schedule row 0x40%02X", this->source_->get_zone(), row);
   }
   if (this->dirty_)
     this->flush_();
@@ -872,6 +888,30 @@ void ZonePauseClimate::publish_all_() {
 // power cut inside that minute would forget a pause while the thermostat keeps the zone
 // held wide, so it is written through straight away, except that writes closer together
 // than SYNC_GAP_MS are merged into one.
+// Raw dump of the schedule row and the bus clock, for checking the register layout against
+// the thermostat (compare with the schedule as Infinitude shows it).
+void ZonePauseClimate::log_schedule_row_() const {
+  const uint8_t zone = this->source_->get_zone();
+  const uint16_t reg = (uint16_t) (infinitesp::REG_TSTAT_SCHEDULE + zone - 1);
+  const auto *row = this->parent_->get_register(infinitesp::ADDR_THERMOSTAT, reg);
+  if (row == nullptr) {
+    ESP_LOGW(TAG, "Zone %d: schedule row not in the register store", zone);
+    return;
+  }
+  char hex[3 * 80 + 1];
+  size_t n = 0;
+  for (size_t i = 0; i < row->size() && i < 80; i++)
+    n += snprintf(hex + n, sizeof(hex) - n, "%02X ", (*row)[i]);
+  ESP_LOGI(TAG, "Zone %d: SCHEDULE ROW 0x%04X (%d bytes): %s", zone, reg, (int) row->size(), hex);
+  const auto *state = this->parent_->get_register(infinitesp::ADDR_THERMOSTAT, infinitesp::REG_SAM_STATE);
+  if (state != nullptr && state->size() > infinitesp::REG3B02_MINUTES + 1) {
+    const uint16_t minutes =
+        ((uint16_t) (*state)[infinitesp::REG3B02_MINUTES] << 8) | (*state)[infinitesp::REG3B02_MINUTES + 1];
+    ESP_LOGI(TAG, "Zone %d: BUS CLOCK weekday byte %d, %02d:%02d (%d minutes since midnight)", zone,
+             (*state)[infinitesp::REG3B02_WEEKDAY], minutes / 60, minutes % 60, minutes);
+  }
+}
+
 void ZonePauseClimate::save_() {
   this->dirty_ = true;
   this->flush_();

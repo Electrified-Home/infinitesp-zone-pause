@@ -158,6 +158,13 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   uint8_t last_actual_cool_{0};
   bool switch_published_{false};
   bool dirty_{false};  // saved state changed but not yet written to flash
+
+  // Schedule probe (feature 2 groundwork): read this zone's weekly schedule row once and log
+  // it raw, with the bus clock, so the layout can be checked against the thermostat itself.
+  bool schedule_polled_{false};
+  bool schedule_logged_{false};
+  uint32_t schedule_poll_at_ms_{0};
+  void log_schedule_row_() const;
   uint32_t last_sync_ms_{0};
 };
 
