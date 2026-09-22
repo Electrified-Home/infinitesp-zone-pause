@@ -43,9 +43,10 @@ Observed on one system; treat it as a starting point, not a specification:
 | Off | **ignored** | **ignored** |
 
 The thermostat only takes the setpoint its current mode uses, and nothing while off. A
-mode change does not alter setpoints. InfinitESP repeats each write three times without an
-acknowledgement, and the thermostat's own reply can lag a change by several seconds.
-The behavior below follows from that.
+mode change does not alter setpoints. InfinitESP repeats each write three times without an acknowledgement, the thermostat's own
+reply can lag a change by several seconds, and the thermostat drops a write when another
+write follows it within a fraction of a second (only the last of a burst is processed), so
+this component never sends two writes back to back. The behavior below follows from that.
 
 ## Behavior
 

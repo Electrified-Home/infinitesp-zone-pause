@@ -56,6 +56,7 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   // What the component is bringing the thermostat to.
   enum Goal : uint8_t { GOAL_NONE = 0, GOAL_PAUSE = 1, GOAL_RESTORE = 2 };
   enum HoldKind : uint8_t { HOLD_KIND_NONE, HOLD_KIND_PERMANENT, HOLD_KIND_TIMED };
+  enum Stage2 : uint8_t { STAGE_NONE, STAGE_HOLD, STAGE_SETPOINTS };
 
   // Saved to flash so a pause, or a restore that has not landed yet, survives a restart.
   // Nothing per-send is kept here.
@@ -101,6 +102,7 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   bool satisfied_(const uint8_t real[2], bool permanent) const;
   void adopt_target_(Side side, uint8_t value);
   void issue_send_(const uint8_t real[2]);
+  void issue_stage2_();
   void judge_(const uint8_t real[2], bool permanent, bool quiet_period_just_ended);
   void end_pause_by_deviation_(const uint8_t real[2], const bool deviated[2]);
   void reconcile_after_restart_(const uint8_t real[2]);
@@ -131,6 +133,11 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   uint32_t last_send_ms_{0};
   uint8_t confirmed_mode_{0xFF};  // the thermostat's own mode nibble, 0xFF until known
   uint8_t resend_count_{0};       // sends repeated because a wanted value did not land
+  // Second half of a send, issued one gap after the first (one bus write at a time).
+  Stage2 stage2_{STAGE_NONE};
+  uint16_t stage2_hold_{0};
+  uint8_t stage2_heat_{0};
+  uint8_t stage2_cool_{0};
   bool have_zones_reply_{false};  // a real 3B03 reply from the thermostat has been seen
   uint32_t last_zones_reply_ms_{0};
 

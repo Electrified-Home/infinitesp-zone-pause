@@ -262,6 +262,7 @@ ZonePauseClimate::HoldKind ZonePauseClimate::restore_hold_kind_() const {
 
 void ZonePauseClimate::set_goal_(Goal goal) {
   this->data_.goal = goal;
+  this->stage2_ = STAGE_NONE;  // a new goal supersedes the second half of the old send
   this->goal_seen_[HEAT] = this->goal_seen_[COOL] = false;
   this->resend_count_ = 0;
   if (goal == GOAL_NONE) {
@@ -478,50 +479,69 @@ void ZonePauseClimate::request_pause(bool pause) {
   this->evaluate_();
 }
 
-// Builds and issues the send for the goal as it is right now. The hub calls run back to
-// back in one call stack: each updates the hub's working copy of the zones register before
-// returning, so the second command is built on top of the first, and the hub's first-in
-// first-out retry queue puts the one queued second last on the wire every time. Do not
-// split them across loop iterations. Re-check that queue whenever the InfinitESP pin moves.
+// Builds and issues the send for the goal as it is right now.
+//
+// One bus write at a time. Seen live on 2026-09-21: the thermostat drops a zones-register
+// write when another one follows it within a fraction of a second (only the last write
+// of a burst is processed). The hub queues each call as its own write, so the two halves
+// of a send (setpoints and hold) go out as two stages: the first now, the second at the
+// next send gap. A hold write is skipped when the thermostat already reads as wanted;
+// setpoint writes alone were seen to leave a permanent hold untouched (30+ writes).
 void ZonePauseClimate::issue_send_(const uint8_t real[2]) {
   const uint8_t zone = this->source_->get_zone();
+  uint8_t dummy[2];
+  bool permanent = false;
+  uint16_t real_hold = 0;
+  this->read_real_(dummy, permanent, &real_hold);
+
   uint8_t heat, cool;
+  bool hold_first = false;   // the edited-scheduled case: release the hold, then set the values
+  bool want_hold = false;    // whether a hold write is part of this send
+  uint16_t hold = 0;
   if (this->data_.goal == GOAL_PAUSE) {
     heat = this->data_.wide_heat;
     cool = this->data_.wide_cool;
-    this->parent_->set_zone_setpoint(zone, heat, cool);
-    // Always sent, also on a zone that is already held: whether a setpoint write alone
-    // keeps a permanent hold permanent is not verified.
-    this->parent_->set_zone_hold(zone, HOLD_PERMANENT);
-    ESP_LOGI(TAG, "Zone %d: sent pause %d / %d with a permanent hold", zone, heat, cool);
+    want_hold = !permanent;
+    hold = HOLD_PERMANENT;
   } else {
     // A side that is no longer owed goes out as its real value.
     heat = this->data_.owed_heat ? this->data_.target_heat : real[HEAT];
     cool = this->data_.owed_cool ? this->data_.target_cool : real[COOL];
-    const HoldKind kind = this->restore_hold_kind_();
-    // The hold is touched only while it is still owed; once it reads as wanted it is left alone.
-    if (!this->data_.restore_hold || !this->data_.owed_hold) {
-      this->parent_->set_zone_setpoint(zone, heat, cool);
-    } else if (kind == HOLD_KIND_PERMANENT) {
-      this->parent_->set_zone_setpoint(zone, heat, cool);
-      this->parent_->set_zone_hold(zone, HOLD_PERMANENT);
-    } else if (kind == HOLD_KIND_TIMED) {
-      this->parent_->set_zone_setpoint(zone, heat, cool);
-      this->parent_->set_zone_hold(zone, this->data_.hold_minutes - this->paused_minutes_);
-    } else if (this->data_.target_changed) {
-      // Scheduled zone, target edited: leave the pause hold first, then set the values, so
-      // the thermostat starts its usual hold at them like any setpoint change.
-      this->parent_->set_zone_hold(zone, 0);
-      this->parent_->set_zone_setpoint(zone, heat, cool);
-    } else {
-      // Scheduled zone: values back, then unhold. The thermostat then loads its schedule
-      // values, or keeps these; either way the zone is not left wide.
-      this->parent_->set_zone_setpoint(zone, heat, cool);
-      this->parent_->set_zone_hold(zone, 0);
+    if (this->data_.restore_hold && this->data_.owed_hold) {
+      switch (this->restore_hold_kind_()) {
+        case HOLD_KIND_PERMANENT:
+          want_hold = !permanent;
+          hold = HOLD_PERMANENT;
+          break;
+        case HOLD_KIND_TIMED:
+          want_hold = true;
+          hold = this->data_.hold_minutes - this->paused_minutes_;
+          break;
+        default:  // back to the schedule
+          want_hold = real_hold != 0;
+          hold = 0;
+          hold_first = this->data_.target_changed;
+          break;
+      }
     }
-    ESP_LOGI(TAG, "Zone %d: sent restore %d / %d (still owed: heat %s, cool %s, hold %s)", zone, heat, cool,
-             YESNO(this->data_.owed_heat), YESNO(this->data_.owed_cool), YESNO(this->data_.owed_hold));
   }
+
+  this->stage2_ = STAGE_NONE;
+  if (want_hold && hold_first) {
+    this->parent_->set_zone_hold(zone, hold);
+    this->stage2_ = STAGE_SETPOINTS;
+    this->stage2_heat_ = heat;
+    this->stage2_cool_ = cool;
+  } else {
+    this->parent_->set_zone_setpoint(zone, heat, cool);
+    if (want_hold) {
+      this->stage2_ = STAGE_HOLD;
+      this->stage2_hold_ = hold;
+    }
+  }
+  ESP_LOGI(TAG, "Zone %d: sent %s %d / %d%s", zone, this->data_.goal == GOAL_PAUSE ? "pause" : "restore", heat, cool,
+           this->stage2_ == STAGE_NONE ? "" : " (hold write follows in 10 s)");
+
   this->add_sent_(HEAT, heat);
   this->add_sent_(COOL, cool);
   this->baseline_[HEAT] = real[HEAT];
@@ -531,6 +551,23 @@ void ZonePauseClimate::issue_send_(const uint8_t real[2]) {
   this->ever_sent_ = true;
   this->in_quiet_ = true;
   this->send_due_ = false;
+}
+
+// The second half of a send, one gap after the first. The quiet period restarts from here;
+// the baseline and what was seen so far are kept.
+void ZonePauseClimate::issue_stage2_() {
+  const uint8_t zone = this->source_->get_zone();
+  if (this->stage2_ == STAGE_HOLD) {
+    this->parent_->set_zone_hold(zone, this->stage2_hold_);
+    ESP_LOGI(TAG, "Zone %d: sent the hold write (%s)", zone,
+             this->stage2_hold_ >= HOLD_PERMANENT ? "permanent" : (this->stage2_hold_ == 0 ? "release" : "timed"));
+  } else {
+    this->parent_->set_zone_setpoint(zone, this->stage2_heat_, this->stage2_cool_);
+    ESP_LOGI(TAG, "Zone %d: sent the setpoints %d / %d", zone, this->stage2_heat_, this->stage2_cool_);
+  }
+  this->stage2_ = STAGE_NONE;
+  this->last_send_ms_ = millis();
+  this->in_quiet_ = true;
 }
 
 // A watched setpoint changed to something that is not ours while the zone was paused: the
@@ -754,20 +791,23 @@ void ZonePauseClimate::evaluate_() {
     this->send_due_ = true;
     this->resend_count_ = 0;
   }
-  if (!this->send_due_)
+  const bool gap_over = !this->ever_sent_ || now - this->last_send_ms_ >= SEND_GAP_MS;
+  if (!this->send_due_) {
+    if (this->stage2_ != STAGE_NONE && gap_over && this->bus_ready_())
+      this->issue_stage2_();
     return;
+  }
   bool lands[2];
   landing_sides_(this->confirmed_mode_, lands[HEAT], lands[COOL]);
   // Nothing is sent into a mode where nothing lands; the send stays due.
   if (!lands[HEAT] && !lands[COOL])
     return;
-  if (this->satisfied_(real, permanent) && !this->in_quiet_) {
+  if (this->satisfied_(real, permanent) && !this->in_quiet_ && this->stage2_ == STAGE_NONE) {
     this->send_due_ = false;  // already where it should be; nothing to send
     return;
   }
-  const bool gap_over = !this->ever_sent_ || now - this->last_send_ms_ >= SEND_GAP_MS;
   if (gap_over && this->bus_ready_() && this->real_is_fresh_())
-    this->issue_send_(real);
+    this->issue_send_(real);  // recomputes the whole send; a pending stage 2 is superseded
 }
 
 void ZonePauseClimate::mirror_from_source_() {
