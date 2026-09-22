@@ -49,7 +49,9 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   void set_actual_heat_sensor(sensor::Sensor *s) { actual_heat_sensor_ = s; }
   void set_actual_cool_sensor(sensor::Sensor *s) { actual_cool_sensor_ = s; }
 
-  void request_pause(bool pause);
+  // send_now false: the caller is about to replace this goal in the same card action, so the
+  // send is left for it (one write sequence, not two).
+  void request_pause(bool pause, bool send_now = true);
   bool is_paused() const { return data_.paused; }
 
  protected:
@@ -109,6 +111,11 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
     // is still due, so the next SET goal writes its hold kind instead of keeping what the
     // thermostat shows.
     bool release_due;
+    // A timed snapshot hold is remembered by the END it had, as minutes of the week on the
+    // thermostat's clock (Sunday 00:00 = 0), so the restore puts back that same end time
+    // however long the pause lasted and whether or not the board restarted.
+    // 0xFFFF: not known (the clock could not be read when the snapshot was taken).
+    uint16_t hold_end_mow;
   } __attribute__((packed));
 
   void ensure_started_();
@@ -196,8 +203,8 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   // A system mode change waiting for the shared gate (a mode write is two bus frames).
   climate::ClimateMode pending_mode_{climate::CLIMATE_MODE_OFF};
   bool pending_mode_valid_{false};
-  // The schedule fallback ("holding N min instead of until the next activity") is logged
-  // once per goal.
+  // Logged once per goal: the schedule fallback ("holding N min instead of until the next
+  // activity"), or a restore whose timed hold had already ended.
   bool hold_fallback_logged_{false};
 
   // Judging: per side, the last real value accounted for, whether the goal value was seen
@@ -208,9 +215,6 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   uint32_t sent_ms_[2][4]{};
   uint8_t sent_count_[2]{0, 0};
 
-  // The minutes paused are not saved, so after a restart a timed hold cannot be put back.
-  bool restarted_since_pause_{false};
-  uint16_t paused_minutes_{0};  // minutes since the snapshot was taken
   uint32_t minute_accum_ms_{0};
   uint32_t last_tick_ms_{0};
   uint8_t last_actual_heat_{0};

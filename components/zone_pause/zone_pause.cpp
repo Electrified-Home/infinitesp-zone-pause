@@ -7,7 +7,7 @@ namespace esphome {
 namespace zone_pause {
 
 static const char *const TAG = "zone_pause";
-static const uint8_t SAVED_VERSION = 4;
+static const uint8_t SAVED_VERSION = 5;
 static const uint32_t SAVED_KEY = 0x5A4F4E46UL;
 static const uint32_t TICK_INTERVAL_MS = 1000;
 // One bus write at a time, house-wide: every setpoint, fan or hold write rewrites the whole
@@ -46,6 +46,11 @@ static const uint32_t SCHEDULE_STALE_MS = 12UL * 3600UL * 1000UL;
 
 static const uint8_t MODE_UNKNOWN = 0xFF;
 static const uint16_t HOLD_PERMANENT = infinitesp::InfinitESPComponent::HOLD_PERMANENT;
+// A timed snapshot hold is kept as the minute of the week it ends on (Sunday 00:00 = 0).
+static const uint16_t MINUTES_PER_WEEK = 7 * 1440;
+static const uint16_t HOLD_END_UNKNOWN = 0xFFFF;
+// The card's own preset for a paused zone. The pause switch is still the automation handle.
+static const char *const PRESET_PAUSED = "Paused";
 static const char *const SIDE_NAMES[2] = {"heat", "cool"};
 static const char *const ACTIVITY_NAMES[5] = {"home", "away", "sleep", "wake", "manual"};
 
@@ -62,12 +67,13 @@ void ZonePauseSwitch::write_state(bool state) {
 void ZonePauseClimate::init() {
   this->set_supported_custom_presets({
       infinitesp::PRESET_SCHEDULE,  infinitesp::PRESET_WAKE,     infinitesp::PRESET_HOLD_TIMED,
-      infinitesp::PRESET_HOLD_PERM, infinitesp::PRESET_VACATION,
+      infinitesp::PRESET_HOLD_PERM, infinitesp::PRESET_VACATION, PRESET_PAUSED,
   });
   this->data_ = Saved{};
   this->data_.version = SAVED_VERSION;
   this->data_.set_fan = NO_FAN;
   this->data_.set_preset = NO_PRESET;
+  this->data_.hold_end_mow = HOLD_END_UNKNOWN;
   this->source_->add_on_state_callback([this](climate::Climate &) {
     if (!this->started_)
       return;
@@ -96,7 +102,6 @@ void ZonePauseClimate::ensure_started_() {
     } else if (loaded.paused || loaded.goal != GOAL_NONE || loaded.desired_heat != 0 || loaded.desired_cool != 0) {
       this->data_ = loaded;
       this->needs_reconcile_ = true;
-      this->restarted_since_pause_ = true;
       ESP_LOGI(TAG, "Zone %d: restarted while %s; checking against the thermostat", this->source_->get_zone(),
                loaded.paused ? "paused" : (loaded.goal != GOAL_NONE ? "a change was still being applied" : "a value was waiting for a mode change"));
     }
@@ -131,8 +136,6 @@ void ZonePauseClimate::on_register_update(uint8_t device_addr, uint16_t register
   this->minute_accum_ms_ += elapsed;
   while (this->minute_accum_ms_ >= 60000) {
     this->minute_accum_ms_ -= 60000;
-    if (this->data_.goal != GOAL_NONE && this->paused_minutes_ < 0xFFFF)
-      this->paused_minutes_++;
     if (this->data_.desired_heat != 0 && this->data_.desired_heat_age < 0xFFFF)
       this->data_.desired_heat_age++;
     if (this->data_.desired_cool != 0 && this->data_.desired_cool_age < 0xFFFF)
@@ -157,8 +160,8 @@ void ZonePauseClimate::on_register_update(uint8_t device_addr, uint16_t register
 
 climate::ClimateTraits ZonePauseClimate::traits() {
   // Same capabilities as the InfinitESP zone it fronts. Its custom presets are registered
-  // on the entity in init(). Pause is not a preset: the pause switch is the only place
-  // that says whether a zone is paused.
+  // on the entity in init(), "Paused" among them: the card can pause a zone and shows a
+  // paused one as Paused. The pause switch is unchanged and stays the automation handle.
   auto traits = climate::ClimateTraits();
   traits.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE | climate::CLIMATE_SUPPORTS_ACTION |
                            climate::CLIMATE_SUPPORTS_TWO_POINT_TARGET_TEMPERATURE);
@@ -298,21 +301,16 @@ void ZonePauseClimate::set_desired_(Side side, uint8_t value) {
   }
 }
 
-// The hold a pause restore puts back (plan 3.5). Without a restart a timed hold comes back
-// only with more than the thermostat's minimum left. After a restart the minutes paused are
-// lost, so a timed hold comes back as "until the next activity" and only while the schedule
-// can be read.
+// The kind of hold a pause restore puts back (plan 3.5). A timed hold is remembered by the
+// end time it had, so a restart makes no difference; whether that end has passed is decided
+// when the hold write is built (issue_send_).
 ZonePauseClimate::HoldKind ZonePauseClimate::restore_hold_kind_() const {
   const uint16_t hold = this->data_.hold_minutes;
   if (hold == 0)
     return HOLD_KIND_NONE;
   if (hold >= HOLD_PERMANENT)
     return HOLD_KIND_PERMANENT;
-  if (this->restarted_since_pause_)
-    return this->schedule_ok_() ? HOLD_KIND_TIMED : HOLD_KIND_NONE;
-  if (hold > this->paused_minutes_ + MIN_TIMED_HOLD)
-    return HOLD_KIND_TIMED;
-  return HOLD_KIND_NONE;
+  return this->data_.hold_end_mow == HOLD_END_UNKNOWN ? HOLD_KIND_NONE : HOLD_KIND_TIMED;
 }
 
 // The hold state as this component sees it: a hold or cancel it wrote itself in the last
@@ -388,10 +386,12 @@ void ZonePauseClimate::begin_set_goal_() {
       this->baseline_[COOL] = real[COOL];
     }
   }
-  // From RESTORE: keep the owed sides and their targets; the hold part is dropped. If that
-  // hold was a release (the zone was on its schedule before the pause), the release is still
-  // due and the next hold write of this goal carries it out.
-  if (this->data_.goal == GOAL_RESTORE && this->data_.restore_hold && this->restore_hold_kind_() == HOLD_KIND_NONE)
+  // From RESTORE: keep the owed sides and their targets; the hold part is dropped. Unless
+  // that restore was putting a permanent hold back, the hold the zone shows (a pause holds it
+  // permanently) is not the hold anybody wants, so a release stays due and the next hold
+  // write of this goal carries it out.
+  if (this->data_.goal == GOAL_RESTORE && this->data_.restore_hold && this->data_.owed_hold &&
+      this->restore_hold_kind_() != HOLD_KIND_PERMANENT)
     this->data_.release_due = true;
   this->set_goal_(GOAL_SET);
   this->data_.owed_hold = false;
@@ -602,43 +602,65 @@ void ZonePauseClimate::control(const climate::ClimateCall &call) {
 
   const bool has_preset = call.has_custom_preset() || call.get_preset().has_value();
   if (has_preset) {
-    if (this->data_.goal == GOAL_PAUSE) {
-      ESP_LOGW(TAG, "Zone %d is paused: preset ignored. Turn the pause off first.", zone);
+    uint8_t activity = NO_PRESET;
+    bool hold_perm = false, hold_cancel = false, pass = false, want_pause = false, hold_timer = false;
+    if (call.get_preset().has_value()) {
+      switch (*call.get_preset()) {
+        case climate::CLIMATE_PRESET_HOME:
+          activity = infinitesp::COMFORT_HOME;
+          break;
+        case climate::CLIMATE_PRESET_AWAY:
+          activity = infinitesp::COMFORT_AWAY;
+          break;
+        case climate::CLIMATE_PRESET_SLEEP:
+          activity = infinitesp::COMFORT_SLEEP;
+          break;
+        default:
+          pass = true;
+          break;
+      }
     } else {
-      uint8_t activity = NO_PRESET;
-      bool hold_perm = false, hold_cancel = false, pass = false;
-      if (call.get_preset().has_value()) {
-        switch (*call.get_preset()) {
-          case climate::CLIMATE_PRESET_HOME:
-            activity = infinitesp::COMFORT_HOME;
-            break;
-          case climate::CLIMATE_PRESET_AWAY:
-            activity = infinitesp::COMFORT_AWAY;
-            break;
-          case climate::CLIMATE_PRESET_SLEEP:
-            activity = infinitesp::COMFORT_SLEEP;
-            break;
-          default:
-            pass = true;
-            break;
-        }
-      } else {
-        auto custom = call.get_custom_preset();
-        if (custom == infinitesp::PRESET_WAKE)
-          activity = infinitesp::COMFORT_WAKE;
-        else if (custom == infinitesp::PRESET_HOLD_PERM)
-          hold_perm = true;
-        else if (custom == infinitesp::PRESET_SCHEDULE)
-          hold_cancel = true;
-        else if (custom == infinitesp::PRESET_HOLD_TIMED) {
+      auto custom = call.get_custom_preset();
+      if (custom == PRESET_PAUSED)
+        want_pause = true;
+      else if (custom == infinitesp::PRESET_WAKE)
+        activity = infinitesp::COMFORT_WAKE;
+      else if (custom == infinitesp::PRESET_HOLD_PERM)
+        hold_perm = true;
+      else if (custom == infinitesp::PRESET_SCHEDULE)
+        hold_cancel = true;
+      else if (custom == infinitesp::PRESET_HOLD_TIMED)
+        hold_timer = true;
+      else
+        pass = true;  // Vacation: InfinitESP handles it
+    }
+    // Picking Paused pauses the zone, exactly as the switch does. Picking any other preset
+    // while the zone is paused means "resume, with this hold": the snapshot values come back
+    // and the preset decides the hold. Vacation is forwarded whether or not the zone is
+    // paused, as it always was.
+    bool resumed = false;
+    if (want_pause) {
+      const bool was_paused = this->data_.paused;
+      this->request_pause(true);
+      if (this->data_.paused && !was_paused)
+        ESP_LOGI(TAG, "Zone %d: paused from the card", zone);
+    } else {
+      if (this->data_.paused && !pass) {
+        // Not sent yet: the preset below replaces this restore's hold in the same action, so
+        // the two go out as one send.
+        this->request_pause(false, /*send_now=*/hold_timer);
+        resumed = true;
+      }
+      if (hold_timer) {
+        if (resumed) {
+          // Identical to the switch going off: the snapshot values and the snapshot's own hold.
+          ESP_LOGI(TAG, "Zone %d: resumed from the card", zone);
+        } else {
           // A readout, not a command: it must not fall through to the hold branch below,
           // which would read it as "back to the schedule".
-          pass = true;
           ESP_LOGI(TAG, "Zone %d: Hold Timer is a readout; set Hold Minutes or Hold Until instead", zone);
-        } else
-          pass = true;  // Vacation: InfinitESP handles it
-      }
-      if (pass) {
+        }
+      } else if (pass) {
         if (call.has_custom_preset()) {
           auto custom = call.get_custom_preset();
           fwd.set_preset(custom.c_str(), custom.size());
@@ -649,12 +671,13 @@ void ZonePauseClimate::control(const climate::ClimateCall &call) {
       } else if (activity != NO_PRESET && in_off) {
         // No setpoint lands in this mode (off, or not known yet); an activity means nothing
         // until the system is on.
-        ESP_LOGI(TAG, "Zone %d: nothing lands in %s; %s not applied", zone, mode_name_(this->confirmed_mode_),
-                 ACTIVITY_NAMES[activity]);
+        ESP_LOGI(TAG, "Zone %d: nothing lands in %s; %s not applied%s", zone, mode_name_(this->confirmed_mode_),
+                 ACTIVITY_NAMES[activity], resumed ? " (zone resumed)" : "");
       } else if (activity != NO_PRESET) {
         uint8_t heat, cool, fan;
         if (!this->comfort_setpoints_(activity, heat, cool, fan)) {
-          ESP_LOGW(TAG, "Zone %d: no comfort profile for %s yet", zone, ACTIVITY_NAMES[activity]);
+          ESP_LOGW(TAG, "Zone %d: no comfort profile for %s yet%s", zone, ACTIVITY_NAMES[activity],
+                   resumed ? " (zone resumed)" : "");
         } else {
           this->begin_set_goal_();
           uint8_t real[2] = {0, 0};
@@ -679,8 +702,8 @@ void ZonePauseClimate::control(const climate::ClimateCall &call) {
           this->data_.set_preset = activity;
           this->send_due_ = true;
           changed = true;
-          ESP_LOGI(TAG, "Zone %d: %s: %d / %d, fan %d, until the next scheduled activity", zone,
-                   ACTIVITY_NAMES[activity], heat, cool, fan);
+          ESP_LOGI(TAG, "Zone %d: %s: %d / %d, fan %d, until the next scheduled activity%s", zone,
+                   ACTIVITY_NAMES[activity], heat, cool, fan, resumed ? " (resumed from the card)" : "");
         }
       } else {
         this->begin_set_goal_();
@@ -696,7 +719,8 @@ void ZonePauseClimate::control(const climate::ClimateCall &call) {
         }
         this->send_due_ = true;
         changed = true;
-        ESP_LOGI(TAG, "Zone %d: %s", zone, hold_perm ? "hold indefinitely (permanent)" : "back to the schedule");
+        ESP_LOGI(TAG, "Zone %d: %s%s", zone, resumed ? "resumed from the card, " : "",
+                 hold_perm ? "hold indefinitely (permanent)" : "back to the schedule");
       }
     }
   }
@@ -713,9 +737,18 @@ void ZonePauseClimate::control(const climate::ClimateCall &call) {
     this->evaluate_();
 }
 
-void ZonePauseClimate::request_pause(bool pause) {
+void ZonePauseClimate::request_pause(bool pause, bool send_now) {
   this->ensure_started_();
   const uint8_t zone = this->source_->get_zone();
+  // A timed hold is remembered by the minute of the week it ends on, from the thermostat's
+  // own clock, so the restore puts back that same end time however long the pause lasts.
+  auto hold_end_of = [this](uint16_t hold) -> uint16_t {
+    uint8_t weekday = 0;
+    uint16_t now_min = 0;
+    if (hold == 0 || hold >= HOLD_PERMANENT || !this->bus_clock_(weekday, now_min))
+      return HOLD_END_UNKNOWN;
+    return (uint16_t) (((uint32_t) weekday * 1440 + now_min + hold) % MINUTES_PER_WEEK);
+  };
 
   // Pausing a paused zone keeps the snapshot (it must never remember the wide values);
   // unpausing a running zone does nothing.
@@ -746,25 +779,28 @@ void ZonePauseClimate::request_pause(bool pause) {
         this->data_.target_heat = real[HEAT];
       if (!this->data_.owed_cool)
         this->data_.target_cool = real[COOL];
-      if (this->data_.goal == GOAL_SET || !this->data_.owed_hold)
+      // A hold this component still owes is not on the thermostat yet, so the hold the
+      // earlier snapshot remembered (and its end time) stands.
+      if (this->data_.goal == GOAL_SET || !this->data_.owed_hold) {
         this->data_.hold_minutes = hold_minutes;
+        this->data_.hold_end_mow = hold_end_of(hold_minutes);
+      }
       ESP_LOGI(TAG, "Zone %d: PAUSE. Remembering %d / %d (hold %u), some of it still on its way", zone,
                this->data_.target_heat, this->data_.target_cool, this->data_.hold_minutes);
     } else {
       this->data_.target_heat = real[HEAT];
       this->data_.target_cool = real[COOL];
       this->data_.hold_minutes = hold_minutes;
+      this->data_.hold_end_mow = hold_end_of(hold_minutes);
       if (!this->in_quiet_) {
         this->baseline_[HEAT] = real[HEAT];
         this->baseline_[COOL] = real[COOL];
       }
       ESP_LOGI(TAG, "Zone %d: PAUSE. Remembering %d / %d (hold %u)", zone, real[HEAT], real[COOL], hold_minutes);
     }
-    // Every new snapshot starts its own clock, whatever was in flight before it: the restore
-    // subtracts these minutes from a timed hold.
-    this->restarted_since_pause_ = false;
-    this->paused_minutes_ = 0;
-    this->minute_accum_ms_ = 0;
+    if (this->data_.hold_end_mow != HOLD_END_UNKNOWN)
+      ESP_LOGI(TAG, "Zone %d: its hold runs to %02u:%02u; the unpause puts it back to that time", zone,
+               (unsigned) (this->data_.hold_end_mow % 1440 / 60), (unsigned) (this->data_.hold_end_mow % 60));
     this->data_.target_changed = false;
     this->data_.wide_heat = this->pause_heat_bus_();
     this->data_.wide_cool = this->pause_cool_bus_();
@@ -784,7 +820,8 @@ void ZonePauseClimate::request_pause(bool pause) {
   this->send_due_ = true;
   this->save_();
   this->publish_all_();
-  this->evaluate_();
+  if (send_now)
+    this->evaluate_();
 }
 
 void ZonePauseClimate::queue_stage_(const Stage &s) {
@@ -857,36 +894,53 @@ void ZonePauseClimate::issue_send_(const uint8_t real[2]) {
     const uint8_t heat = this->data_.owed_heat ? this->data_.target_heat : real[HEAT];
     const uint8_t cool = this->data_.owed_cool ? this->data_.target_cool : real[COOL];
     const bool want_hold = this->data_.restore_hold && this->data_.owed_hold;
-    switch (want_hold ? this->restore_hold_kind_() : HOLD_KIND_NONE) {
+    HoldKind kind = want_hold ? this->restore_hold_kind_() : HOLD_KIND_NONE;
+    // A timed hold goes back to the end time it had. What is left of it is worked out from
+    // the thermostat's clock now, at the moment this write is built.
+    const bool timed_snapshot = this->data_.hold_minutes != 0 && this->data_.hold_minutes < HOLD_PERMANENT;
+    uint16_t timed_minutes = 0;
+    if (want_hold && timed_snapshot) {
+      const uint16_t end = this->data_.hold_end_mow;
+      uint8_t weekday = 0;
+      uint16_t now_min = 0;
+      const bool have_clock = end != HOLD_END_UNKNOWN && this->bus_clock_(weekday, now_min);
+      const uint16_t left =
+          have_clock ? (uint16_t) (((uint32_t) end + MINUTES_PER_WEEK - (weekday * 1440 + now_min)) % MINUTES_PER_WEEK)
+                     : 0;
+      if (have_clock && left >= MIN_TIMED_HOLD && left <= MAX_TIMED_HOLD) {
+        timed_minutes = left;
+        kind = HOLD_KIND_TIMED;
+      } else {
+        // The end has gone by, or it is not known (the thermostat's clock could not be read
+        // when the snapshot was taken, or cannot be read now): the zone goes back to its
+        // schedule instead, exactly as a snapshot with no hold does.
+        this->data_.hold_minutes = 0;
+        this->data_.hold_end_mow = HOLD_END_UNKNOWN;
+        kind = HOLD_KIND_NONE;
+        if (!this->hold_fallback_logged_) {
+          this->hold_fallback_logged_ = true;
+          if (have_clock)
+            ESP_LOGI(TAG,
+                     "Zone %d: the hold you had until %02u:%02u has passed or ends within 15 minutes; back to the "
+                     "schedule",
+                     zone, (unsigned) (end % 1440 / 60), (unsigned) (end % 60));
+          else
+            ESP_LOGI(TAG, "Zone %d: the time your hold ran to is not known, so it cannot be put back; back to the "
+                          "schedule",
+                     zone);
+        }
+      }
+    }
+    switch (kind) {
       case HOLD_KIND_PERMANENT:
         setpoint_stage(heat, cool);
         if (view != HOLD_KIND_PERMANENT)
           hold_stage(HOLD_PERMANENT);
         break;
-      case HOLD_KIND_TIMED: {
-        // The minutes paused are not saved, so after a restart the hold comes back as
-        // "until the next activity"; otherwise it comes back with what was left of it.
-        uint16_t minutes;
-        bool fallback = false;
-        if (this->restarted_since_pause_) {
-          minutes = this->minutes_to_next_activity_();
-          if (minutes == 0) {
-            minutes = this->minimum_hold_ != 0 ? this->minimum_hold_ : 60;
-            fallback = true;
-          }
-        } else {
-          const uint16_t snapshot = this->data_.hold_minutes;
-          minutes = snapshot > this->paused_minutes_ ? (uint16_t) (snapshot - this->paused_minutes_) : 0;
-        }
-        if (fallback && !this->hold_fallback_logged_) {
-          this->hold_fallback_logged_ = true;
-          ESP_LOGW(TAG, "Zone %d: schedule not readable; holding %u min instead of until the next activity", zone,
-                   minutes);
-        }
-        hold_stage(minutes);
+      case HOLD_KIND_TIMED:
+        hold_stage(timed_minutes);
         setpoint_stage(heat, cool);
         break;
-      }
       default:
         if (!want_hold) {
           setpoint_stage(heat, cool);
@@ -1508,6 +1562,12 @@ void ZonePauseClimate::mirror_from_source_() {
 // mode governs, plus the fan; the manual row excluded), the schedule breaking a tie when
 // there is no hold; otherwise the hold kind. Judged from the thermostat's own replies.
 void ZonePauseClimate::infer_preset_() {
+  // A paused zone says so on the card. The pause switch is unchanged and stays the handle
+  // automations use.
+  if (this->data_.paused) {
+    this->set_custom_preset_(PRESET_PAUSED);
+    return;
+  }
   if (this->data_.goal == GOAL_PAUSE || this->data_.goal == GOAL_RESTORE) {
     this->clear_custom_preset_();
     this->preset.reset();

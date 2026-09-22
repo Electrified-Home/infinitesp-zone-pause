@@ -94,15 +94,15 @@ Also observed, and relied on by the presets and holds feature:
    exception: it stays paused and simply stops resending.
 5. **Putting the zone back** follows the hold it was on: a permanent hold comes back with
    the setpoints; a scheduled zone gets its values back and the hold released; a timed hold
-   comes back with the time it had left if that is more than 15 minutes (the thermostat's
-   minimum), or, after a restart (the time left is no longer known), until the next scheduled
-   activity when the schedule can be read; either is written before the setpoints because a
-   timed-hold write resets a zone to its schedule values. Otherwise the zone returns to its
-   schedule. A part the current mode will not
+   comes back to the same end time it had (the snapshot keeps the end time from the
+   thermostat's own clock, so a restart or a long pause does not change it), written before the
+   setpoints because a timed-hold write resets a zone to its schedule values. If that end time
+   has already passed, the zone returns to its schedule. A part the current mode will not
    take stays owed and is delivered when the mode allows; meanwhile the card keeps showing
    the target.
 6. **Mode and fan are not affected by pause.** A target edited while paused is remembered
-   and applied when the pause ends. Presets are ignored while paused. A system mode change
+   and applied when the pause ends. Presets picked while paused resume the zone (see Presets
+   and holds). A system mode change
    goes through the same write gate as every other write (one write at a time, house-wide),
    so it can wait up to about 10 seconds; the card shows the requested mode meanwhile.
 7. **Pause state survives a restart** of the ESP32, including a power cut, and is checked
@@ -129,6 +129,10 @@ Carrier wall control, so the card works for day to day changes on its own.
 - **Hold Indefinitely** is a real command: a permanent hold at the zone's current settings.
 - **Hold Timer** is a readout, not a command. Tapping it writes nothing.
 - **Vacation** is handled by InfinitESP itself and is unchanged here.
+- **Paused** appears in the list while a zone is paused, and picking it pauses the zone (same as
+  the switch). While paused, picking any other entry resumes to the remembered values with that
+  hold: Hold Timer resumes exactly as the switch does, Hold Indefinitely resumes on a permanent
+  hold, Per Schedule releases to the schedule, an activity applies that activity.
 - While the system mode is Off, presets do nothing; the log says so. A temperature edit made
   while Off is kept as a desired value (below).
 
