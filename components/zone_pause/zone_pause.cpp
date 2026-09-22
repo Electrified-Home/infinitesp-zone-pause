@@ -514,8 +514,11 @@ void ZonePauseClimate::issue_send_(const uint8_t real[2]) {
           hold = HOLD_PERMANENT;
           break;
         case HOLD_KIND_TIMED:
+          // Seen live 2026-09-21: a timed-hold write resets the setpoints to the schedule's
+          // values, so the hold goes first and the setpoints follow at the next gap.
           want_hold = true;
           hold = this->data_.hold_minutes - this->paused_minutes_;
+          hold_first = true;
           break;
         default:  // back to the schedule
           want_hold = real_hold != 0;

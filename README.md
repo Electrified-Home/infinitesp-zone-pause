@@ -67,7 +67,8 @@ this component never sends two writes back to back. The behavior below follows f
 5. **Putting the zone back** follows the hold it was on: a permanent hold comes back with
    the setpoints; a scheduled zone gets its values back and the hold released; a timed hold
    comes back with the time it had left if that is more than 15 minutes (the thermostat's
-   minimum), otherwise the zone returns to its schedule. A part the current mode will not
+   minimum), written before the setpoints because a timed-hold write resets a zone to its
+   schedule values; otherwise the zone returns to its schedule. A part the current mode will not
    take stays owed and is delivered when the mode allows; meanwhile the card keeps showing
    the target.
 6. **Mode and fan are not affected by pause.** A target edited while paused is remembered
