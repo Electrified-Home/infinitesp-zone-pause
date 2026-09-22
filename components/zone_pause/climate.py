@@ -21,6 +21,7 @@ AUTO_LOAD = ["sensor", "switch"]
 CONF_SOURCE_ID = "source_id"
 CONF_PAUSE_HEAT_SETPOINT = "pause_heat_setpoint"
 CONF_PAUSE_COOL_SETPOINT = "pause_cool_setpoint"
+CONF_MINIMUM_HOLD = "minimum_hold"
 CONF_PAUSE_SWITCH = "pause_switch"
 CONF_ACTUAL_HEAT_SETPOINT = "actual_heat_setpoint"
 CONF_ACTUAL_COOL_SETPOINT = "actual_cool_setpoint"
@@ -56,6 +57,10 @@ CONFIG_SCHEMA = cv.All(
             # Whole degrees FAHRENHEIT, the unit the Carrier bus works in (not Celsius).
             cv.Optional(CONF_PAUSE_HEAT_SETPOINT, default=50): cv.int_range(min=40, max=99),
             cv.Optional(CONF_PAUSE_COOL_SETPOINT, default=85): cv.int_range(min=40, max=99),
+            # A temperature change on a zone following its schedule holds until the next
+            # scheduled activity (as the wall does) but never less than this many minutes.
+            # 0 = exactly like the wall. Whole minutes; the thermostat rounds to 15.
+            cv.Optional(CONF_MINIMUM_HOLD, default=60): cv.int_range(min=0, max=1425),
             cv.Required(CONF_PAUSE_SWITCH): switch.switch_schema(
                 ZonePauseSwitch, icon="mdi:pause-circle-outline"
             ),
@@ -77,6 +82,7 @@ async def to_code(config):
     source = await cg.get_variable(config[CONF_SOURCE_ID])
     cg.add(var.set_source(source))
     cg.add(var.set_pause_setpoints(config[CONF_PAUSE_HEAT_SETPOINT], config[CONF_PAUSE_COOL_SETPOINT]))
+    cg.add(var.set_minimum_hold(config[CONF_MINIMUM_HOLD]))
 
     sw = await switch.new_switch(config[CONF_PAUSE_SWITCH])
     cg.add(sw.set_parent(var))
