@@ -34,7 +34,7 @@ ZonePauseSwitch = zone_pause_ns.class_("ZonePauseSwitch", switch.Switch)
 
 
 def _validate(config):
-    # Carrier keeps heat and cool at least 2 degrees apart (MIN_GAP in zone_pause.cpp).
+    # Carrier keeps heat and cool at least 2 degrees apart; the wide pair must respect that too.
     if config[CONF_PAUSE_HEAT_SETPOINT] + 2 > config[CONF_PAUSE_COOL_SETPOINT]:
         raise cv.Invalid("pause_heat_setpoint must be at least 2 below pause_cool_setpoint")
     return config

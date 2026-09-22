@@ -88,8 +88,8 @@ Also observed, and relied on by the presets and holds feature:
    that value stands. In heat mode only the heat setpoint counts, in cool mode only the cool
    setpoint, in auto and off both. A change to the other setpoint is kept as that side's
    new target and the pause carries on.
-4. **A send that does not land is repeated** up to three times when the thermostat's own
-   reply shows the value did not arrive. After that the component gives up, says so in the
+4. **A send that does not land is repeated once** when the thermostat's own reply shows
+   the value did not arrive (the hub itself already repeats every write three times). After that the component gives up, says so in the
    log as an error, and the card shows what the thermostat really holds. A pause is the one
    exception: it stays paused and simply stops resending.
 5. **Putting the zone back** follows the hold it was on: a permanent hold comes back with
@@ -129,6 +129,8 @@ Carrier wall control, so the card works for day to day changes on its own.
 - **Hold Indefinitely** is a real command: a permanent hold at the zone's current settings.
 - **Hold Timer** is a readout, not a command. Tapping it writes nothing.
 - **Vacation** is handled by InfinitESP itself and is unchanged here.
+- While the system mode is Off, presets do nothing; the log says so. A temperature edit made
+  while Off is kept as a desired value (below).
 
 ### Temperature edits
 
@@ -156,9 +158,8 @@ always holds for exactly the time left until the next scheduled activity.
 
 A setpoint side the current mode does not use (cool in Heat, heat in Cool, either side in Off)
 cannot be written yet. The card shows it as a desired value and delivers it once the mode
-changes to accept it. It is dropped instead when the schedule moves to its next period, when a
-person changes the hold, when that side is changed at the wall, or after 24 hours, whichever
-comes first. A preset's undeliverable side is dropped right away, since a preset is a "do this
+changes to accept it. It is dropped instead when that side changes for any other reason (the wall, the
+schedule, a newer edit) or after 24 hours, whichever comes first. A preset's undeliverable side is dropped right away, since a preset is a "do this
 now" action.
 
 ### How the preset name is chosen

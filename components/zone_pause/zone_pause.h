@@ -149,7 +149,6 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   void end_pause_by_deviation_(const uint8_t real[2], const bool deviated[2]);
   void reconcile_after_restart_(const uint8_t real[2]);
   void deliver_desired_(const uint8_t real[2]);
-  void expire_desired_(uint8_t period_now, HoldKind hold_now);
   void evaluate_();
   void mirror_from_source_();
   void infer_preset_();
@@ -162,9 +161,8 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   bool bus_clock_(uint8_t &weekday, uint16_t &minutes) const;
   bool schedule_ok_() const;
   uint16_t minutes_to_next_activity_() const;
-  uint8_t schedule_activity_now_(uint8_t *period_index = nullptr) const;
+  uint8_t schedule_activity_now_() const;
   bool comfort_setpoints_(uint8_t activity, uint8_t &heat, uint8_t &cool, uint8_t &fan) const;
-  void log_schedule_row_() const;
 
   infinitesp::InfinitESPClimate *source_{nullptr};
   ZonePauseSwitch *pause_switch_{nullptr};
@@ -195,8 +193,6 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   HoldKind own_hold_kind_{HOLD_KIND_NONE};
   uint32_t own_hold_ms_{0};
   bool own_hold_valid_{false};
-  uint8_t last_sent_[2]{0, 0};    // for coalescing: the final target is compared with these
-  bool last_sent_valid_{false};
   // A system mode change waiting for the shared gate (a mode write is two bus frames).
   climate::ClimateMode pending_mode_{climate::CLIMATE_MODE_OFF};
   bool pending_mode_valid_{false};
@@ -208,7 +204,6 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   // during the quiet period, and the values this component sent since the goal was NONE.
   uint8_t baseline_[2]{0, 0};
   bool goal_seen_[2]{false, false};
-  bool fan_seen_{false};
   uint8_t sent_[2][4]{};
   uint32_t sent_ms_[2][4]{};
   uint8_t sent_count_[2]{0, 0};
@@ -225,13 +220,9 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   uint32_t last_sync_ms_{0};
 
   // Schedule row: read once at boot and every 6 hours (each read costs the hub one missed poll).
-  bool schedule_logged_{false};
   uint32_t schedule_poll_at_ms_{0};
   uint32_t schedule_read_ms_{0};
   bool schedule_read_valid_{false};
-  uint8_t period_seen_{0xFF};          // schedule period the zone was last seen in (desired expiry)
-  HoldKind real_hold_seen_{HOLD_KIND_NONE};
-  bool seen_primed_{false};            // the two above were taken from the first reading
   // The last real setpoints seen, to spot a change made by something else while nothing of
   // ours is in flight.
   uint8_t last_real_[2]{0, 0};
