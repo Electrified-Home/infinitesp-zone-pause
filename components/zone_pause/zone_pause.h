@@ -2,8 +2,10 @@
 
 #include "esphome/core/preferences.h"
 #include "esphome/components/climate/climate.h"
+#include "esphome/components/number/number.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/switch/switch.h"
+#include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/infinitesp/infinitesp.h"
 #include "esphome/components/infinitesp/infinitesp_climate.h"
 
@@ -21,9 +23,22 @@ class ZonePauseSwitch : public switch_::Switch {
   ZonePauseClimate *parent_{nullptr};
 };
 
+// The zone's Hold Minutes: shows the target's minutes left, and a write sets how long the
+// target holds; see ZonePauseClimate::hold_minutes_write.
+class ZonePauseHoldMinutes : public number::Number {
+ public:
+  void set_parent(ZonePauseClimate *parent) { parent_ = parent; }
+
+ protected:
+  void control(float value) override;
+  ZonePauseClimate *parent_{nullptr};
+};
+
 // Proxy thermostat shown to Home Assistant for one Carrier zone. It always carries the
 // TARGET settings. Behavior: see the README, sections "Behavior" and "Presets and holds".
-// It knows nothing about why a zone is paused; it only obeys the pause switch.
+// It knows nothing about why a zone is paused: it obeys the pause switch, keeps one target
+// per zone (a setting the mode cannot take yet waits in it) and tells its own writes apart
+// from anybody else's changes.
 //
 // Deliberately NOT an ESPHome Component. InfinitESP documents an outage caused by
 // extra Component registrations next to its hub, so this follows the same
@@ -48,6 +63,10 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   void set_pause_switch(ZonePauseSwitch *sw) { pause_switch_ = sw; }
   void set_actual_heat_sensor(sensor::Sensor *s) { actual_heat_sensor_ = s; }
   void set_actual_cool_sensor(sensor::Sensor *s) { actual_cool_sensor_ = s; }
+  void set_hold_minutes_number(ZonePauseHoldMinutes *n) { hold_minutes_number_ = n; }
+  void set_setting_status_sensor(text_sensor::TextSensor *s) { setting_status_sensor_ = s; }
+  // Hold Minutes was set: 0 the schedule, else a timed hold of that many minutes (at least 30).
+  void hold_minutes_write(float minutes);
 
   // send_now false: the caller is about to replace this goal in the same card action, so the
   // send is left for it (one write sequence, not two).
@@ -59,14 +78,23 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   // What the component is bringing the thermostat to.
   enum Goal : uint8_t { GOAL_NONE = 0, GOAL_PAUSE = 1, GOAL_RESTORE = 2, GOAL_SET = 3 };
   enum HoldKind : uint8_t { HOLD_KIND_NONE, HOLD_KIND_PERMANENT, HOLD_KIND_TIMED };
-  // The hold a SET goal wants (decided against the hold state when the write goes out).
+  // The hold a SET goal carries: always the kind of the target's hold (begin_set_goal_).
   enum SetHold : uint8_t {
-    SET_HOLD_KEEP = 0,        // no hold write
-    SET_HOLD_TIMED_NEXT = 1,  // until the next scheduled activity, exactly (presets)
-    SET_HOLD_TIMED_MIN = 2,   // until the next activity, at least minimum_hold (edits)
-    SET_HOLD_PERMANENT = 3,
-    SET_HOLD_CANCEL = 4,
+    SET_HOLD_KEEP = 0,       // no SET goal
+    SET_HOLD_TIMED_END = 1,  // timed, to the target's end (hold_end_mow)
+    SET_HOLD_PERMANENT = 2,
+    SET_HOLD_CANCEL = 3,
   };
+  // The hold a change gets (hold_for_change_): minutes 0 the schedule, HOLD_PERMANENT no end,
+  // else timed to `end`; `owed` when it has to be written.
+  struct Held {
+    uint16_t minutes;
+    uint16_t end;
+    bool owed;
+  };
+  // What hold_for_change_ is asked for besides Hold Minutes 0-1425.
+  static const int CHANGE_EDIT = -1;
+  static const int CHANGE_PRESET = -2;
   enum StageKind : uint8_t { STAGE_HOLD, STAGE_SETPOINTS, STAGE_FAN };
   struct Stage {
     StageKind kind;
@@ -85,11 +113,12 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
     uint8_t version;
     bool paused;
     uint8_t goal;
-    uint8_t target_heat;    // bus units. PAUSE: the snapshot. RESTORE / SET: the value being put
-                            // back or set (an edit or an accepted outside change replaces it).
+    // The zone's one target: its values (bus units) and its hold. PAUSE: the snapshot, which
+    // the unpause puts back. RESTORE / SET: what is being put back or set. Idle: the
+    // thermostat's own hold, copied on every evaluation.
+    uint8_t target_heat;
     uint8_t target_cool;
-    uint16_t hold_minutes;  // hold when paused: 0 none, 0xFFFF permanent, else timed
-    bool target_changed;    // the target was edited while paused
+    uint16_t hold_minutes;  // 0 the schedule, 0xFFFF no end, else timed (to hold_end_mow)
     uint8_t wide_heat;      // wide values in force for this pause
     uint8_t wide_cool;
     bool owed_heat;         // RESTORE / SET: parts that have not landed yet
@@ -102,21 +131,22 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
     uint8_t set_hold;       // SetHold
     uint16_t set_hold_minutes;  // the timed hold actually written, for judging
     uint8_t set_preset;     // activity index the card chose, NO_PRESET for a plain edit
-    // Values the current mode could not take, kept for when it can (0 = none)
+    // A side of the target the current mode cannot take yet, kept for when it can (0 = none).
+    // It shares the target's hold and lasts as long as it.
     uint8_t desired_heat;
     uint8_t desired_cool;
-    uint16_t desired_heat_age;  // minutes
-    uint16_t desired_cool_age;
     // A pause restore was releasing the hold when a card action superseded it: the release
     // is still due, so the next SET goal writes its hold kind instead of keeping what the
-    // thermostat shows.
+    // thermostat shows. It outlives the goal only while the target waits.
     bool release_due;
-    // A timed snapshot hold is remembered by the END it had, as minutes of the week on the
+    // A timed target is remembered by the END it has, as minutes of the week on the
     // thermostat's clock (Sunday 00:00 = 0), so the restore puts back that same end time
     // however long the pause lasted and whether or not the board restarted.
-    // 0xFFFF: not known (the clock could not be read when the snapshot was taken).
+    // 0xFFFF: not known (the clock could not be read).
     uint16_t hold_end_mow;
+    uint8_t spare[5];
   } __attribute__((packed));
+  static_assert(sizeof(Saved) == 29, "keep the saved record at 29 bytes so a version change is logged");
 
   void ensure_started_();
   bool read_real_(uint8_t real[2], bool &permanent, uint16_t *hold_minutes = nullptr, bool *timed = nullptr,
@@ -139,12 +169,26 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   }
   uint8_t desired_(Side side) const { return side == HEAT ? data_.desired_heat : data_.desired_cool; }
   void set_desired_(Side side, uint8_t value);
+  bool waiting_() const { return data_.desired_heat != 0 || data_.desired_cool != 0; }
   HoldKind restore_hold_kind_() const;
   HoldKind hold_view_(bool permanent, bool timed, uint16_t hold_minutes) const;
   void set_goal_(Goal goal);
   void begin_set_goal_();
+  // The target: its hold, a valid pair, and how it ends.
+  bool now_mow_(uint16_t &now) const;
+  uint16_t minutes_left_(uint16_t end) const;
+  bool hold_for_change_(int asked, Held &out, bool goes_out_now = true);
+  void store_hold_(const Held &h);
+  static uint8_t set_hold_of_(uint16_t hold_minutes);
+  static bool make_valid_(uint8_t &heat, uint8_t &cool, Side won);
+  void to_schedule_();
+  void drop_waiting_(const char *why, bool ran_out = false);
+  void someone_else_(const char *why = "the zone was changed elsewhere") { this->drop_waiting_(why); }
+  void end_target_(const uint8_t real[2], const char *why);
+  void minute_tick_();
   void add_sent_(Side side, uint8_t value);
   bool is_sent_(Side side, uint8_t value) const;
+  bool other_sent_(Side side, uint8_t value) const;
   bool satisfied_(const uint8_t real[2], bool permanent, bool timed, uint16_t hold_minutes, uint8_t fan) const;
   bool hold_landed_(bool permanent, bool timed, uint16_t hold_minutes) const;
   void adopt_target_(Side side, uint8_t value);
@@ -159,14 +203,16 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   void evaluate_();
   void mirror_from_source_();
   void infer_preset_();
+  void show_activity_(uint8_t activity);
   void publish_actual_(uint8_t heat, uint8_t cool);
+  void publish_hold_minutes_();
   void publish_all_();
   void save_();
   void flush_();
 
   // Schedule (register 0x4002 + zone-1) and bus clock
   bool bus_clock_(uint8_t &weekday, uint16_t &minutes) const;
-  bool schedule_ok_() const;
+  const std::vector<uint8_t> *schedule_row_() const;
   uint16_t minutes_to_next_activity_() const;
   uint8_t schedule_activity_now_() const;
   bool comfort_setpoints_(uint8_t activity, uint8_t &heat, uint8_t &cool, uint8_t &fan) const;
@@ -175,6 +221,8 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   ZonePauseSwitch *pause_switch_{nullptr};
   sensor::Sensor *actual_heat_sensor_{nullptr};
   sensor::Sensor *actual_cool_sensor_{nullptr};
+  ZonePauseHoldMinutes *hold_minutes_number_{nullptr};
+  text_sensor::TextSensor *setting_status_sensor_{nullptr};
 
   uint8_t pause_heat_f_{50};
   uint8_t pause_cool_f_{85};
@@ -203,16 +251,25 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   // A system mode change waiting for the shared gate (a mode write is two bus frames).
   climate::ClimateMode pending_mode_{climate::CLIMATE_MODE_OFF};
   bool pending_mode_valid_{false};
-  // Logged once per goal: the schedule fallback ("holding N min instead of until the next
-  // activity"), or a restore whose timed hold had already ended.
+  // Logged once per goal: a restore whose timed hold had already ended.
   bool hold_fallback_logged_{false};
+  // The current goal's hold write has gone out (reset at each goal start except the SET join and
+  // a join of a RESTORE whose hold went out, and when the target's hold changes).
+  bool hold_sent_{false};
+  // A timed-hold write or a release makes the thermostat load its schedule's values: the first
+  // judgement after the send takes a side moved to a value that is neither its goal nor one we
+  // sent for that reload, not for someone else's change.
+  bool reload_expected_{false};
+  // Why the target was dropped or given up, for Setting Status; cleared by the next accepted
+  // change, a pause or an unpause.
+  const char *drop_why_{nullptr};
 
   // Judging: per side, the last real value accounted for, whether the goal value was seen
-  // during the quiet period, and the values this component sent since the goal was NONE.
+  // during the quiet period, and the values this component sent in the current send chain
+  // (the writes since the zone was last judged; a goal can take several chains).
   uint8_t baseline_[2]{0, 0};
   bool goal_seen_[2]{false, false};
   uint8_t sent_[2][4]{};
-  uint32_t sent_ms_[2][4]{};
   uint8_t sent_count_[2]{0, 0};
 
   uint32_t minute_accum_ms_{0};
@@ -227,9 +284,11 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   uint32_t schedule_poll_at_ms_{0};
   uint32_t schedule_read_ms_{0};
   bool schedule_read_valid_{false};
-  // The last real setpoints seen, to spot a change made by something else while nothing of
-  // ours is in flight.
+  // The previous evaluation's real setpoints and hold (the hold as evaluate_ reads it: 0,
+  // HOLD_PERMANENT or a countdown), to spot a change made by something else while nothing of ours
+  // is in flight, and whether a paused zone in OFF showed a hold before its values moved (judge_).
   uint8_t last_real_[2]{0, 0};
+  uint16_t last_hold_{0};
   bool last_real_valid_{false};
 };
 
