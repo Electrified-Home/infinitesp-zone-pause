@@ -31,8 +31,8 @@ Per zone you get:
 | Thermostat (climate) | Always shows the **target** settings, never the wide pause values |
 | Pause switch | On = paused, off = running. The handle for automations (the card also shows a Paused preset) |
 | Actual heat / cool setpoint sensors (required) | What the thermostat really holds right now. The card never shows this, so these are the truth channel |
-| Hold Minutes (optional number) | Minutes left on a timed hold (reads 0 for the schedule or a permanent hold; see InfinitESP's Hold State). Write 0 for the schedule |
-| Hold Until (optional time) | Where the target's timed hold ends, as a time of day (unknown with no timed hold). Settable: it is the same hold as Hold Minutes, set by the clock; a time is rounded UP, so the hold ends at it or up to 14 minutes after, never before |
+| Hold Minutes (optional number) | Minutes left on a timed hold (reads 0 for the schedule or a permanent hold; see InfinitESP's Hold State). Type any whole number of minutes to start a timed hold: the thermostat only takes 15-minute steps, so the board rounds up (under 15 becomes 15, 16 becomes 30). Type 0 for the schedule. The zone's temperatures stay as they are |
+| Hold Until (optional sensor, read-only) | The clock time the target's timed hold ends, like `14:16` (unknown with no timed hold). It only shows the end; to change the hold, set Hold Minutes |
 | Setting Status (optional text sensor) | What a waiting setting is waiting for, or why one was dropped |
 
 These work with Home Assistant's standard thermostat card, toggle and number box; no custom
@@ -58,7 +58,7 @@ Switch InfinitESP's own `hold_minutes` and `hold_until` off on the hidden block:
 holds behind this component's back, and a timed hold set there ends a pause when it runs
 out. This component's Hold Minutes replaces InfinitESP's Hold Minutes; give it the name
 InfinitESP's had, `"<Zone> Hold Minutes"`, so its entity id does not change. Hold Until is
-replaced the same way, by `"<Zone> Hold Until"`.
+replaced the same way, by `"<Zone> Hold Until"`, now a read-only sensor.
 
 ```yaml
 climate:
@@ -86,7 +86,7 @@ climate:
       name: "Upstairs Actual Cool Setpoint"
     hold_minutes:              # optional
       name: "Upstairs Hold Minutes"
-    hold_until:                # optional
+    hold_until:                # optional, read-only: the clock time the hold ends
       name: "Upstairs Hold Until"
     setting_status:            # optional
       name: "Upstairs Setting Status"
@@ -97,7 +97,7 @@ climate:
 This component needs a fork of InfinitESP, and both components must be pinned by **commit
 SHA**. Use this InfinitESP entry in place of any existing one; your other
 `external_components` entries stay. For `zone_pause`, open this repository's Releases (or
-Tags) page, find the tagged release `rev7.1` (or newer), and copy the commit SHA it points to into `ref`.
+Tags) page, find the tagged release `rev7.2` (or newer), and copy the commit SHA it points to into `ref`.
 
 ```yaml
 external_components:
@@ -108,7 +108,7 @@ external_components:
   - source:
       type: git
       url: https://github.com/Electrified-Home/infinitesp-zone-pause
-      ref: <commit of the rev7.1 tag>   # the full SHA from the rev7.1 tag, never a branch
+      ref: <commit of the rev7.2 tag>   # the full SHA from the rev7.2 tag, never a branch
     components: [zone_pause]
 ```
 
@@ -318,7 +318,8 @@ shows as a plain manual hold, not by name.
 
 Whatever is sent lasts at least 30 minutes: a hold armed for a change is never shorter, a
 timed hold with under about 23 minutes left is stretched to 30, and one with more keeps its
-end. A restore is not a change; it puts back the time that was left. `minimum_hold` is a
+end. A restore is not a change; it puts back the time that was left. Nor is an explicit
+Hold Minutes: it is honoured as typed, rounded up to 15 (Hold Minutes 15 holds 15 minutes). `minimum_hold` is a
 further floor under the hold an edit arms on a scheduled zone (0 = only the 30 minutes); it
 does not affect presets. Holds are written to the nearest 15 minutes and the thermostat
 counts them on that grid, so a hold can end a few minutes either side of the minute asked
@@ -347,10 +348,13 @@ for; the pinned InfinitESP only ever rounds a running countdown up, never early.
 
 The optional Hold Minutes number is described above. Writing **0** returns the zone to its
 schedule (a temperature given just before it is dropped, as Per Schedule does); writing
-**N** (15 to 1425, steps of 15; a hold that is sent lasts at least 30) makes a timed hold of
-N minutes. Given with a temperature, in either order, the two form one target; the hold is
-written first and the setpoints after it, because a timed-hold write resets the zone to its
-schedule values. While paused, or in Off, it goes into the target and waits.
+**N** (any whole number up to 1425) makes a timed hold of N minutes from now, rounded UP to
+the thermostat's 15-minute steps, at least 15 (5 and 15 both give 15; 16 gives 30). The
+30-minute minimum is for the hold a temperature edit starts by itself, not for Hold Minutes.
+A Hold Minutes alone is sent: the hold is written first and, about 10 seconds later, the
+zone's own setpoints are written back, because a timed-hold write resets the zone to its
+schedule values. Given with a temperature, in either order, the two form one target.
+While paused, or in Off, it goes into the target and waits.
 
 ### Setting Status
 
