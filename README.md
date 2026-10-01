@@ -32,6 +32,7 @@ Per zone you get:
 | Pause switch | On = paused, off = running. The handle for automations (the card also shows a Paused preset) |
 | Actual heat / cool setpoint sensors (required) | What the thermostat really holds right now. The card never shows this, so these are the truth channel |
 | Hold Minutes (optional number) | Minutes left on a timed hold (reads 0 for the schedule or a permanent hold; see InfinitESP's Hold State). Write 0 for the schedule |
+| Hold Until (optional time) | Where the target's timed hold ends, as a time of day (unknown with no timed hold). Settable: it is the same hold as Hold Minutes, set by the clock; a time is rounded UP, so the hold ends at it or up to 14 minutes after, never before |
 | Setting Status (optional text sensor) | What a waiting setting is waiting for, or why one was dropped |
 
 These work with Home Assistant's standard thermostat card, toggle and number box; no custom
@@ -57,7 +58,7 @@ Switch InfinitESP's own `hold_minutes` and `hold_until` off on the hidden block:
 holds behind this component's back, and a timed hold set there ends a pause when it runs
 out. This component's Hold Minutes replaces InfinitESP's Hold Minutes; give it the name
 InfinitESP's had, `"<Zone> Hold Minutes"`, so its entity id does not change. Hold Until is
-not replaced: that entity disappears, along with its entity id and history.
+replaced the same way, by `"<Zone> Hold Until"`.
 
 ```yaml
 climate:
@@ -68,7 +69,7 @@ climate:
     internal: true
     zone: 1
     hold_minutes: false        # replaced by zone_pause's Hold Minutes
-    hold_until: false
+    hold_until: false          # replaced by zone_pause's Hold Until
 
   - platform: zone_pause
     infinitesp_id: infinitesp_hub
@@ -85,6 +86,8 @@ climate:
       name: "Upstairs Actual Cool Setpoint"
     hold_minutes:              # optional
       name: "Upstairs Hold Minutes"
+    hold_until:                # optional
+      name: "Upstairs Hold Until"
     setting_status:            # optional
       name: "Upstairs Setting Status"
 ```
@@ -94,7 +97,7 @@ climate:
 This component needs a fork of InfinitESP, and both components must be pinned by **commit
 SHA**. Use this InfinitESP entry in place of any existing one; your other
 `external_components` entries stay. For `zone_pause`, open this repository's Releases (or
-Tags) page, find the tagged release `rev7`, and copy the commit SHA it points to into `ref`.
+Tags) page, find the tagged release `rev7.1` (or newer), and copy the commit SHA it points to into `ref`.
 
 ```yaml
 external_components:
@@ -105,7 +108,7 @@ external_components:
   - source:
       type: git
       url: https://github.com/Electrified-Home/infinitesp-zone-pause
-      ref: <commit of the rev7 tag>   # the full SHA from the rev7 tag, never a branch
+      ref: <commit of the rev7.1 tag>   # the full SHA from the rev7.1 tag, never a branch
     components: [zone_pause]
 ```
 
@@ -150,7 +153,7 @@ climate:
     device_id: zone_upstairs
     pause_switch:
       device_id: zone_upstairs   # likewise on actual_heat_setpoint, actual_cool_setpoint,
-      name: "Upstairs Pause"     # hold_minutes and setting_status
+      name: "Upstairs Pause"     # hold_minutes, hold_until and setting_status
 ```
 
 Existing entities keep their names. With names unchanged, Home Assistant's code (2025.8 or

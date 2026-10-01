@@ -1,4 +1,5 @@
 #include "zone_pause.h"
+#include "esphome/core/controller_registry.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 #include <cmath>
@@ -78,6 +79,16 @@ static_assert(end_of_(6 * 1440 + 1430, 30) == 20, "Saturday 23:50 + 30 ends Sund
 static_assert(left_(6 * 1440 + 1430, 20) == 30 && valid_left_(30), "and is 30 minutes away");
 static_assert(left_(6 * 1440 + 1430, 6 * 1440 + 1425) == 10075 && !valid_left_(10075), "an end 5 minutes past");
 static_assert(left_(6 * 1440 + 1430, 6 * 1440 + 1430) == 0 && !valid_left_(0), "an end equal to now");
+// Hold Until: the minutes from now to the next time the clock reads `target`, both minutes of the day.
+// 1 to 1440, never 0 (that would be the schedule): a time already passed, or this very minute, is tomorrow's.
+static constexpr uint16_t until_(uint16_t target, uint16_t now_minute) {
+  return (uint16_t) ((target + 1439 - now_minute) % 1440 + 1);
+}
+static_assert(until_(17 * 60 + 30, 15 * 60 + 7) == 143, "17:30 from 15:07 is 2 h 23 min");
+static_assert(until_(15 * 60 + 8, 15 * 60 + 7) == 1 && until_(15 * 60 + 6, 15 * 60 + 7) == 1439,
+              "the next minute is 1; the minute before is tomorrow's");
+static_assert(until_(15 * 60 + 7, 15 * 60 + 7) == 1440, "this very minute is tomorrow's, not 0");
+static_assert(until_(0, 23 * 60 + 59) == 1 && until_(23 * 60 + 59, 0) == 1439, "across midnight");
 // Two minute counts the hub's nearest-15 rounding puts on the same quarter hour.
 static bool same_quarter_(uint16_t a, uint16_t b) {
   return infinitesp::InfinitESPComponent::normalize_timed_hold(a) ==
@@ -113,6 +124,46 @@ void ZonePauseHoldMinutes::control(float value) {
   if (this->parent_ != nullptr)
     this->parent_->hold_minutes_write(value);
 }
+
+#ifdef USE_DATETIME_TIME
+// The seconds of a write are ignored.
+void ZonePauseHoldUntil::control(const datetime::TimeCall &call) {
+  const auto hour = call.get_hour();
+  const auto minute = call.get_minute();
+  if (this->parent_ != nullptr && hour.has_value() && minute.has_value())
+    this->parent_->hold_until_write(*hour, *minute);
+}
+
+// Published only when it changes. With no timed hold a time entity has no 0 to show (00:00 would
+// read as "until midnight"), so it goes unknown, which Home Assistant shows as such. publish_state()
+// cannot do that: it tells nobody when the time is out of range, so the state is cleared here and
+// the frontends are told with the same call publish_state() ends with.
+void ZonePauseHoldUntil::show(int minute_of_day) {
+  if (minute_of_day < 0) {
+    if (this->has_state()) {
+      this->set_has_state(false);
+#ifdef USE_CONTROLLER_REGISTRY
+      ControllerRegistry::notify_time_update(this);
+#endif
+    }
+    return;
+  }
+  // An idle zone's end is worked out from the thermostat's clock and its hold countdown, which the hub
+  // reads about 3 s apart, so around each minute change it wobbles by a minute. A move of one minute
+  // (or none) is not shown; holds change by more than that.
+  if (this->has_state()) {
+    const int apart = (minute_of_day - (this->hour_ * 60 + this->minute_) + 1440) % 1440;
+    if (apart <= 1 || apart >= 1439)
+      return;
+  }
+  const uint8_t hour = minute_of_day / 60;
+  const uint8_t minute = minute_of_day % 60;
+  this->hour_ = hour;
+  this->minute_ = minute;
+  this->second_ = 0;
+  this->publish_state();
+}
+#endif
 
 // Hold Minutes is how long the target holds, in any state: it goes through the shared gate
 // like every write and applies even when the temperature is already there. With a temperature
@@ -168,6 +219,38 @@ void ZonePauseClimate::hold_minutes_write(float minutes) {
   this->publish_all_();
   if (this->send_due_)
     this->evaluate_();
+}
+
+// Hold Until is Hold Minutes set by the clock: the minutes from now to the NEXT time the
+// thermostat's clock reads hour:minute (1-1440: a time already passed, or this very minute, is
+// tomorrow's), then exactly what setting Hold Minutes to that number does. So it has the same
+// grid, rounding, limits (1440 is held as 1425), 30-minute minimum when the change goes out, and
+// paused rule. The grid counts the minutes from now, so the end is at the time asked or up to 14 minutes after it,
+// never before (the 1425 maximum and the 30-minute minimum aside); Hold Until then shows the end it really has.
+void ZonePauseClimate::hold_until_write(uint8_t hour, uint8_t minute) {
+  this->ensure_started_();
+  uint16_t now = 0;
+  if (!this->now_mow_(now)) {
+    ESP_LOGE(TAG, "Zone %d: change refused: the thermostat's clock is not known yet, so Hold Until cannot be timed",
+             this->source_->get_zone());
+    this->publish_all_();
+    return;
+  }
+  // Up to the hold's 15-minute grid (owner, 2026-09-30: "7:05" ends at the first grid point at or after it), so the hold
+  // never ends before the time asked; Hold Minutes' own nearest-15 rounding then leaves it as it is.
+  const uint16_t want = until_(hour * 60 + minute, now % 1440);
+  uint16_t asked = (want + 14) / 15 * 15;
+  // A running timed hold in the same quarter keeps its own end (hold_for_change_), which can be up to 14 minutes before
+  // the time asked: step to the next quarter so it is written and never ends early (the 1425 maximum aside).
+  const uint16_t met = this->data_.hold_minutes;
+  if (met != 0 && met < HOLD_PERMANENT) {
+    const uint16_t left = this->minutes_left_(this->data_.hold_end_mow);
+    if (valid_left_(left) && left < want && same_quarter_(left, asked) && asked + 15 <= MAX_WRITTEN_HOLD)
+      asked += 15;
+  }
+  ESP_LOGD(TAG, "Zone %d: Hold Until %02u:%02u is Hold Minutes %u (up to the 15-minute grid)", this->source_->get_zone(),
+           (unsigned) hour, (unsigned) minute, (unsigned) asked);
+  this->hold_minutes_write((float) asked);
 }
 
 void ZonePauseClimate::init() {
@@ -268,6 +351,7 @@ void ZonePauseClimate::on_register_update(uint8_t device_addr, uint16_t register
   if (minute) {
     this->minute_tick_();
     this->publish_hold_minutes_();
+    this->publish_hold_until_();
   }
 }
 
@@ -2159,10 +2243,24 @@ void ZonePauseClimate::publish_hold_minutes_() {
     this->hold_minutes_number_->publish_state(value);
 }
 
+// Hold Until shows where Hold Minutes' minutes left end, as a time of day: shown exactly when Hold
+// Minutes shows more than 0, unknown when it shows 0 (the schedule, a hold with no end, an end
+// that has passed, or the thermostat's clock not known). Refreshed wherever Hold Minutes is.
+void ZonePauseClimate::publish_hold_until_() {
+#ifdef USE_DATETIME_TIME
+  if (this->hold_until_time_ == nullptr || !this->started_)
+    return;
+  const uint16_t hold = this->data_.hold_minutes;
+  const uint16_t left = hold != 0 && hold < HOLD_PERMANENT ? this->minutes_left_(this->data_.hold_end_mow) : 0;
+  this->hold_until_time_->show(valid_left_(left) ? this->data_.hold_end_mow % 1440 : -1);
+#endif
+}
+
 void ZonePauseClimate::publish_all_() {
   this->mirror_from_source_();
   this->publish_state();
   this->publish_hold_minutes_();
+  this->publish_hold_until_();
   if (this->pause_switch_ != nullptr &&
       (!this->switch_published_ || this->pause_switch_->state != this->data_.paused)) {
     this->switch_published_ = true;

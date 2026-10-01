@@ -1,6 +1,6 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import climate, number, sensor, switch, text_sensor
+from esphome.components import climate, datetime, number, sensor, switch, text_sensor
 from esphome.components.infinitesp import (
     CONF_INFINITESP_ID,
     InfinitESPComponent,
@@ -16,7 +16,7 @@ from esphome.const import (
 )
 
 DEPENDENCIES = ["infinitesp"]
-AUTO_LOAD = ["number", "sensor", "switch", "text_sensor"]
+AUTO_LOAD = ["datetime", "number", "sensor", "switch", "text_sensor"]
 
 CONF_SOURCE_ID = "source_id"
 CONF_PAUSE_HEAT_SETPOINT = "pause_heat_setpoint"
@@ -26,6 +26,7 @@ CONF_PAUSE_SWITCH = "pause_switch"
 CONF_ACTUAL_HEAT_SETPOINT = "actual_heat_setpoint"
 CONF_ACTUAL_COOL_SETPOINT = "actual_cool_setpoint"
 CONF_HOLD_MINUTES = "hold_minutes"
+CONF_HOLD_UNTIL = "hold_until"
 CONF_SETTING_STATUS = "setting_status"
 
 zone_pause_ns = cg.esphome_ns.namespace("zone_pause")
@@ -34,6 +35,7 @@ zone_pause_ns = cg.esphome_ns.namespace("zone_pause")
 ZonePauseClimate = zone_pause_ns.class_("ZonePauseClimate", climate.Climate, InfinitESPEntity)
 ZonePauseSwitch = zone_pause_ns.class_("ZonePauseSwitch", switch.Switch)
 ZonePauseHoldMinutes = zone_pause_ns.class_("ZonePauseHoldMinutes", number.Number)
+ZonePauseHoldUntil = zone_pause_ns.class_("ZonePauseHoldUntil", datetime.TimeEntity)
 
 
 def _validate(config):
@@ -79,6 +81,10 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_HOLD_MINUTES): number.number_schema(
                 ZonePauseHoldMinutes, unit_of_measurement="min", icon="mdi:timer-outline"
             ),
+            # Optional: where the target's hold ends, as a time of day, read and set: Hold Minutes by the clock
+            # (the zone's own Hold Until, in place of InfinitESP's: turn that one off with hold_until: false on
+            # the hidden block). Unknown with no timed hold.
+            cv.Optional(CONF_HOLD_UNTIL): datetime.time_schema(ZonePauseHoldUntil),
             # Optional: what the target is waiting for, or why a waiting one was dropped.
             cv.Optional(CONF_SETTING_STATUS): text_sensor.text_sensor_schema(),
         }
@@ -111,6 +117,10 @@ async def to_code(config):
         num = await number.new_number(config[CONF_HOLD_MINUTES], min_value=0, max_value=1425, step=15)
         cg.add(num.set_parent(var))
         cg.add(var.set_hold_minutes_number(num))
+    if CONF_HOLD_UNTIL in config:
+        tm = await datetime.new_datetime(config[CONF_HOLD_UNTIL])
+        cg.add(tm.set_parent(var))
+        cg.add(var.set_hold_until_time(tm))
     if CONF_SETTING_STATUS in config:
         sens = await text_sensor.new_text_sensor(config[CONF_SETTING_STATUS])
         cg.add(var.set_setting_status_sensor(sens))

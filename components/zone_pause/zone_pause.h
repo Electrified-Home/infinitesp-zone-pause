@@ -1,7 +1,11 @@
 #pragma once
 
+#include "esphome/core/defines.h"
 #include "esphome/core/preferences.h"
 #include "esphome/components/climate/climate.h"
+#ifdef USE_DATETIME_TIME
+#include "esphome/components/datetime/time_entity.h"
+#endif
 #include "esphome/components/number/number.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/switch/switch.h"
@@ -34,6 +38,22 @@ class ZonePauseHoldMinutes : public number::Number {
   ZonePauseClimate *parent_{nullptr};
 };
 
+#ifdef USE_DATETIME_TIME
+// The zone's Hold Until: Hold Minutes by the clock. It shows the end of the target's hold as a time
+// of day, and a write sets the hold to end then; see ZonePauseClimate::hold_until_write. Not a
+// Component, like the rest of this file's entities.
+class ZonePauseHoldUntil : public datetime::TimeEntity {
+ public:
+  void set_parent(ZonePauseClimate *parent) { parent_ = parent; }
+  // The hold end as a minute of the day (0-1439), or -1 for no timed hold: unknown.
+  void show(int minute_of_day);
+
+ protected:
+  void control(const datetime::TimeCall &call) override;
+  ZonePauseClimate *parent_{nullptr};
+};
+#endif
+
 // Proxy thermostat shown to Home Assistant for one Carrier zone. It always carries the
 // TARGET settings. Behavior: see the README, sections "Behavior" and "Presets and holds".
 // It knows nothing about why a zone is paused: it obeys the pause switch, keeps one target
@@ -64,9 +84,14 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   void set_actual_heat_sensor(sensor::Sensor *s) { actual_heat_sensor_ = s; }
   void set_actual_cool_sensor(sensor::Sensor *s) { actual_cool_sensor_ = s; }
   void set_hold_minutes_number(ZonePauseHoldMinutes *n) { hold_minutes_number_ = n; }
+#ifdef USE_DATETIME_TIME
+  void set_hold_until_time(ZonePauseHoldUntil *t) { hold_until_time_ = t; }
+#endif
   void set_setting_status_sensor(text_sensor::TextSensor *s) { setting_status_sensor_ = s; }
   // Hold Minutes was set: 0 the schedule, else a timed hold of that many minutes (at least 30).
   void hold_minutes_write(float minutes);
+  // Hold Until was set: Hold Minutes for the next time the clock reads hour:minute.
+  void hold_until_write(uint8_t hour, uint8_t minute);
 
   // send_now false: the caller is about to replace this goal in the same card action, so the
   // send is left for it (one write sequence, not two).
@@ -206,6 +231,7 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   void show_activity_(uint8_t activity);
   void publish_actual_(uint8_t heat, uint8_t cool);
   void publish_hold_minutes_();
+  void publish_hold_until_();
   void publish_all_();
   void save_();
   void flush_();
@@ -222,6 +248,9 @@ class ZonePauseClimate : public climate::Climate, public infinitesp::InfinitESPE
   sensor::Sensor *actual_heat_sensor_{nullptr};
   sensor::Sensor *actual_cool_sensor_{nullptr};
   ZonePauseHoldMinutes *hold_minutes_number_{nullptr};
+#ifdef USE_DATETIME_TIME
+  ZonePauseHoldUntil *hold_until_time_{nullptr};
+#endif
   text_sensor::TextSensor *setting_status_sensor_{nullptr};
 
   uint8_t pause_heat_f_{50};
